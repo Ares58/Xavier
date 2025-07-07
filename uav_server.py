@@ -319,7 +319,17 @@ if __name__ == "__main__":
     uav_server.telemetry_interval = args.telemetry_interval
     
     try:
-        asyncio.run(uav_server.start_server(args.host, args.port))
+        # Python 3.6 uyumluluğu için asyncio.run() yerine
+        if hasattr(asyncio, 'run'):
+            # Python 3.7+
+            asyncio.run(uav_server.start_server(args.host, args.port))
+        else:
+            # Python 3.6 ve altı
+            loop = asyncio.get_event_loop()
+            try:
+                loop.run_until_complete(uav_server.start_server(args.host, args.port))
+            finally:
+                loop.close()
     except KeyboardInterrupt:
         logger.info("Sunucu durduruldu")
     except Exception as e:
