@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UAV WebSocket Server
-Havada olan UAV için optimize edilmiş WebSocket sunucusu
+UAV Basit WebSocket Server
+Python 3.6+ ile uyumlu, basit ve güvenilir UAV kontrol sunucusu
 """
 
 import asyncio
@@ -10,147 +10,133 @@ import json
 import subprocess
 import logging
 import time
-import psutil
-import socket
-from datetime import datetime
-from typing import Dict, Set
+import threading
 import signal
 import sys
+import os
 
 # Logging yapılandırması
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/var/log/uav_server.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-class UAVServer:
-    def __init__(self):
-        self.clients: Set[websockets.WebSocketServerProtocol] = set()
-        self.is_running = True
-        self.telemetry_interval = 1.0  # Telemetri gönderme aralığı (saniye)
+class SimpleUAVServer:
+    def __init__(self, host='0.0.0.0', port=8765):
+        self.host = host
+        self.port = port
+        self.clients = set()
+        self.running = True
         
-        # İzin verilen komutlar (güvenlik için)
-        self.allowed_commands = {
+        # İzin verilen komutlar
+        self.commands = {
             'system_info': 'uname -a',
-            'disk_usage': 'df -h',
             'memory_info': 'free -h',
+            'disk_usage': 'df -h',
             'network_info': 'ip addr show',
-            'processes': 'ps aux',
-            'uptime': 'uptime',
-            'temperature': 'sensors',
-            'gpio_status': 'gpio readall',  # Raspberry Pi için
-            'wifi_status': 'iwconfig',
+            'wifi_status': 'iwconfig 2>/dev/null || echo "iwconfig bulunamadı"',
             'ping_test': 'ping -c 4 8.8.8.8',
-            'reboot': 'sudo reboot',
-            'shutdown': 'sudo shutdown -h now'
+            'uptime': 'uptime',
+            'date': 'date',
+            'processes': 'ps aux | head -20',
+            'temperature': 'sensors 2>/dev/null || echo "sensors bulunamadı"'
         }
         
-        # Signal handler'ları ayarla
+        # Signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
     
     def signal_handler(self, signum, frame):
-        """Graceful shutdown için signal handler"""
         logger.info(f"Signal {signum} alındı, sunucu kapatılıyor...")
-        self.is_running = False
+        self.running = False
         sys.exit(0)
     
-    async def register_client(self, websocket):
-        """Yeni istemci kaydı"""
-        self.clients.add(websocket)
-        client_ip = websocket.remote_address[0]
-        logger.info(f"Yeni istemci bağlandı: {client_ip}")
-        
-        # Bağlantı onayı gönder
-        await self.send_to_client(websocket, {
-            'type': 'connection_established',
-            'message': 'UAV bağlantısı başarılı',
-            'server_time': datetime.now().isoformat(),
-            'server_info': await self.get_system_info()
-        })
-    
-    async def unregister_client(self, websocket):
-        """İstemci kaydını kaldır"""
-        self.clients.discard(websocket)
-        logger.info(f"İstemci bağlantısı kesildi: {websocket.remote_address[0]}")
-    
-    async def send_to_client(self, websocket, data):
-        """Tek istemciye mesaj gönder"""
+    def get_system_info(self):
+        """Basit sistem bilgilerini al"""
         try:
-            await websocket.send(json.dumps(data))
-        except websockets.exceptions.ConnectionClosed:
-            await self.unregister_client(websocket)
+            # CPU bilgisi
+            with open('/proc/loadavg', 'r') as f:
+                load_avg = f.read().strip().split()[:3]
+            
+            # Memory bilgisi
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+                mem_total = None
+                mem_free = None
+                for line in meminfo.split('\n'):
+                    if line.startswith('MemTotal:'):
+                        mem_total = int(line.split()[1])
+                    elif line.startswith('MemAvailable:'):
+                        mem_free = int(line.split()[1])
+                        break
+            
+            # Disk bilgisi
+            disk_usage = os.statvfs('/')
+            disk_free = disk_usage.f_bavail * disk_usage.f_frsize
+            disk_total = disk_usage.f_blocks * disk_usage.f_frsize
+            
+            return {
+                'load_average': load_avg,
+                'memory_total_kb': mem_total,
+                'memory_free_kb': mem_free,
+                'memory_usage_percent': ((mem_total - mem_free) / mem_total * 100) if mem_total and mem_free else 0,
+                'disk_free_bytes': disk_free,
+                'disk_total_bytes': disk_total,
+                'disk_usage_percent': ((disk_total - disk_free) / disk_total * 100) if disk_total > 0 else 0,
+                'uptime': time.time() - os.path.getmtime('/proc/uptime'),
+                'timestamp': time.time()
+            }
+        except Exception as e:
+            logger.error(f"Sistem bilgisi alınamadı: {e}")
+            return {'error': str(e)}
     
-    async def broadcast_to_all(self, data):
-        """Tüm istemcilere mesaj gönder"""
-        if self.clients:
-            await asyncio.gather(
-                *[self.send_to_client(client, data) for client in self.clients.copy()],
-                return_exceptions=True
-            )
-    
-    async def get_system_info(self):
-        """Sistem bilgilerini al"""
-        return {
-            'hostname': socket.gethostname(),
-            'cpu_percent': psutil.cpu_percent(),
-            'memory_percent': psutil.virtual_memory().percent,
-            'disk_percent': psutil.disk_usage('/').percent,
-            'uptime': time.time() - psutil.boot_time(),
-            'network_interfaces': self.get_network_interfaces()
-        }
-    
-    def get_network_interfaces(self):
-        """Ağ arayüzlerini al"""
-        interfaces = {}
-        for interface, addresses in psutil.net_if_addrs().items():
-            for addr in addresses:
-                if addr.family == socket.AF_INET:
-                    interfaces[interface] = addr.address
-        return interfaces
-    
-    async def execute_command(self, command_key, params=None):
-        """Güvenli komut çalıştırma"""
-        if command_key not in self.allowed_commands:
+    def execute_command(self, command_key, params=None):
+        """Komut çalıştır"""
+        if command_key not in self.commands:
             return {
                 'success': False,
-                'error': f'Komut izin verilmiyor: {command_key}',
-                'available_commands': list(self.allowed_commands.keys())
+                'error': f'Komut bulunamadı: {command_key}',
+                'available_commands': list(self.commands.keys())
             }
         
         try:
-            command = self.allowed_commands[command_key]
+            command = self.commands[command_key]
             
-            # Parametreli komutlar için
-            if params and command_key == 'ping_test':
-                target = params.get('target', '8.8.8.8')
-                command = f'ping -c 4 {target}'
+            # Ping testi için özel parametre
+            if command_key == 'ping_test' and params and 'target' in params:
+                target = params['target']
+                # Basit IP/domain validasyonu
+                if target.replace('.', '').replace('-', '').isalnum() or '.' in target:
+                    command = f'ping -c 4 {target}'
+                else:
+                    return {'success': False, 'error': 'Geçersiz hedef adresi'}
             
             logger.info(f"Komut çalıştırılıyor: {command}")
             
-            result = subprocess.run(
+            # Komut çalıştır
+            process = subprocess.Popen(
                 command,
                 shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30  # 30 saniye timeout
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
+            
+            # Timeout ile bekle
+            stdout, stderr = process.communicate(timeout=30)
             
             return {
                 'success': True,
                 'command': command_key,
-                'output': result.stdout,
-                'error': result.stderr,
-                'return_code': result.returncode,
-                'timestamp': datetime.now().isoformat()
+                'output': stdout,
+                'error': stderr,
+                'return_code': process.returncode,
+                'timestamp': time.time()
             }
             
         except subprocess.TimeoutExpired:
+            process.kill()
             return {
                 'success': False,
                 'error': 'Komut zaman aşımına uğradı (30s)',
@@ -164,174 +150,160 @@ class UAVServer:
                 'command': command_key
             }
     
-    async def handle_message(self, websocket, message):
-        """Gelen mesajları işle"""
+    async def handle_client(self, websocket, path):
+        """İstemci ile iletişim"""
+        client_ip = websocket.remote_address[0]
+        logger.info(f"Yeni istemci: {client_ip}")
+        
+        # İstemciyi kaydet
+        self.clients.add(websocket)
+        
         try:
-            data = json.loads(message)
-            message_type = data.get('type')
+            # Bağlantı onayı gönder
+            await websocket.send(json.dumps({
+                'type': 'connection_established',
+                'message': 'UAV bağlantısı başarılı',
+                'timestamp': time.time(),
+                'system_info': self.get_system_info()
+            }))
             
-            if message_type == 'command':
-                command_key = data.get('command')
-                params = data.get('params', {})
-                
-                result = await self.execute_command(command_key, params)
-                await self.send_to_client(websocket, {
-                    'type': 'command_result',
-                    'request_id': data.get('request_id'),
-                    **result
-                })
-            
-            elif message_type == 'ping':
-                await self.send_to_client(websocket, {
-                    'type': 'pong',
-                    'timestamp': datetime.now().isoformat()
-                })
-            
-            elif message_type == 'get_telemetry':
-                telemetry = await self.get_telemetry_data()
-                await self.send_to_client(websocket, {
-                    'type': 'telemetry',
-                    **telemetry
-                })
-            
-            else:
-                await self.send_to_client(websocket, {
-                    'type': 'error',
-                    'message': f'Bilinmeyen mesaj tipi: {message_type}'
-                })
-                
-        except json.JSONDecodeError:
-            await self.send_to_client(websocket, {
-                'type': 'error',
-                'message': 'Geçersiz JSON formatı'
-            })
+            # Mesaj döngüsü
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    await self.process_message(websocket, data)
+                except json.JSONDecodeError:
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': 'Geçersiz JSON'
+                    }))
+                except Exception as e:
+                    logger.error(f"Mesaj işleme hatası: {e}")
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': str(e)
+                    }))
+        
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(f"İstemci ayrıldı: {client_ip}")
         except Exception as e:
-            logger.error(f"Mesaj işleme hatası: {e}")
-            await self.send_to_client(websocket, {
+            logger.error(f"İstemci hatası: {e}")
+        finally:
+            self.clients.discard(websocket)
+    
+    async def process_message(self, websocket, data):
+        """Mesaj işle"""
+        message_type = data.get('type')
+        
+        if message_type == 'command':
+            command_key = data.get('command')
+            params = data.get('params', {})
+            request_id = data.get('request_id')
+            
+            result = self.execute_command(command_key, params)
+            result['type'] = 'command_result'
+            result['request_id'] = request_id
+            
+            await websocket.send(json.dumps(result))
+        
+        elif message_type == 'ping':
+            await websocket.send(json.dumps({
+                'type': 'pong',
+                'timestamp': time.time()
+            }))
+        
+        elif message_type == 'get_system_info':
+            system_info = self.get_system_info()
+            await websocket.send(json.dumps({
+                'type': 'system_info',
+                'data': system_info
+            }))
+        
+        elif message_type == 'get_telemetry':
+            telemetry = {
+                'type': 'telemetry',
+                'timestamp': time.time(),
+                'system_info': self.get_system_info()
+            }
+            await websocket.send(json.dumps(telemetry))
+        
+        else:
+            await websocket.send(json.dumps({
                 'type': 'error',
-                'message': str(e)
-            })
-    
-    async def get_telemetry_data(self):
-        """Telemetri verilerini al"""
-        return {
-            'timestamp': datetime.now().isoformat(),
-            'system_info': await self.get_system_info(),
-            'network_stats': self.get_network_stats(),
-            'battery_info': self.get_battery_info() if hasattr(psutil, 'sensors_battery') else None
-        }
-    
-    def get_network_stats(self):
-        """Ağ istatistiklerini al"""
-        stats = psutil.net_io_counters()
-        return {
-            'bytes_sent': stats.bytes_sent,
-            'bytes_recv': stats.bytes_recv,
-            'packets_sent': stats.packets_sent,
-            'packets_recv': stats.packets_recv
-        }
-    
-    def get_battery_info(self):
-        """Batarya bilgilerini al (varsa)"""
-        try:
-            battery = psutil.sensors_battery()
-            if battery:
-                return {
-                    'percent': battery.percent,
-                    'power_plugged': battery.power_plugged,
-                    'time_left': battery.secsleft if battery.secsleft != psutil.POWER_TIME_UNLIMITED else None
-                }
-        except:
-            pass
-        return None
+                'message': f'Bilinmeyen mesaj tipi: {message_type}'
+            }))
     
     async def telemetry_broadcaster(self):
-        """Periyodik telemetri yayını"""
-        while self.is_running:
+        """Telemetri yayınlayıcısı"""
+        while self.running:
             try:
                 if self.clients:
-                    telemetry = await self.get_telemetry_data()
-                    await self.broadcast_to_all({
+                    telemetry = {
                         'type': 'telemetry_broadcast',
-                        **telemetry
-                    })
+                        'timestamp': time.time(),
+                        'system_info': self.get_system_info()
+                    }
+                    
+                    # Tüm istemcilere gönder
+                    disconnected = []
+                    for client in self.clients.copy():
+                        try:
+                            await client.send(json.dumps(telemetry))
+                        except websockets.exceptions.ConnectionClosed:
+                            disconnected.append(client)
+                        except Exception as e:
+                            logger.error(f"Telemetri gönderme hatası: {e}")
+                            disconnected.append(client)
+                    
+                    # Bağlantısı kopan istemcileri temizle
+                    for client in disconnected:
+                        self.clients.discard(client)
                 
-                await asyncio.sleep(self.telemetry_interval)
+                await asyncio.sleep(2)  # 2 saniyede bir telemetri
+                
             except Exception as e:
                 logger.error(f"Telemetri yayın hatası: {e}")
-                await asyncio.sleep(self.telemetry_interval)
+                await asyncio.sleep(2)
     
-    async def handle_client(self, websocket, path):
-        """İstemci bağlantısını yönet"""
-        await self.register_client(websocket)
-        
-        try:
-            async for message in websocket:
-                await self.handle_message(websocket, message)
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("İstemci bağlantısı normal şekilde kapandı")
-        except Exception as e:
-            logger.error(f"İstemci işleme hatası: {e}")
-        finally:
-            await self.unregister_client(websocket)
-    
-    async def start_server(self, host='0.0.0.0', port=8765):
+    def start_server(self):
         """Sunucuyu başlat"""
-        logger.info(f"UAV WebSocket sunucusu başlatılıyor: {host}:{port}")
+        logger.info(f"UAV WebSocket sunucusu başlatılıyor: {self.host}:{self.port}")
         
-        # Telemetri yayıncısını başlat
-        telemetry_task = asyncio.create_task(self.telemetry_broadcaster())
+        # Event loop al
+        loop = asyncio.get_event_loop()
         
-        # WebSocket sunucusunu başlat
-        server = await websockets.serve(
+        # Sunucu başlat
+        start_server = websockets.serve(
             self.handle_client,
-            host,
-            port,
-            ping_interval=10,  # 10 saniyede bir ping
-            ping_timeout=5,    # 5 saniye ping timeout
-            max_size=1024*1024  # 1MB max mesaj boyutu
+            self.host,
+            self.port,
+            ping_interval=20,
+            ping_timeout=10
         )
         
-        logger.info("UAV WebSocket sunucusu başarıyla başlatıldı")
+        # Telemetri task'ı başlat
+        telemetry_task = loop.create_task(self.telemetry_broadcaster())
         
         try:
-            await server.wait_closed()
+            loop.run_until_complete(start_server)
+            logger.info("Sunucu başarıyla başlatıldı")
+            loop.run_forever()
         except KeyboardInterrupt:
             logger.info("Sunucu kapatılıyor...")
+        except Exception as e:
+            logger.error(f"Sunucu hatası: {e}")
         finally:
             telemetry_task.cancel()
-            server.close()
-            await server.wait_closed()
+            loop.close()
 
-# Ana çalıştırma
 if __name__ == "__main__":
-    uav_server = UAVServer()
-    
-    # Komut satırı argümanları
     import argparse
-    parser = argparse.ArgumentParser(description='UAV WebSocket Server')
-    parser.add_argument('--host', default='0.0.0.0', help='Sunucu host adresi')
-    parser.add_argument('--port', type=int, default=8765, help='Sunucu port numarası')
-    parser.add_argument('--telemetry-interval', type=float, default=1.0, help='Telemetri gönderim aralığı (saniye)')
+    
+    parser = argparse.ArgumentParser(description='UAV Basit WebSocket Server')
+    parser.add_argument('--host', default='0.0.0.0', help='Host adresi')
+    parser.add_argument('--port', type=int, default=8765, help='Port numarası')
     
     args = parser.parse_args()
     
-    uav_server.telemetry_interval = args.telemetry_interval
-    
-    try:
-        # Python 3.6 uyumluluğu için asyncio.run() yerine
-        if hasattr(asyncio, 'run'):
-            # Python 3.7+
-            asyncio.run(uav_server.start_server(args.host, args.port))
-        else:
-            # Python 3.6 ve altı
-            loop = asyncio.get_event_loop()
-            try:
-                loop.run_until_complete(uav_server.start_server(args.host, args.port))
-            finally:
-                loop.close()
-    except KeyboardInterrupt:
-        logger.info("Sunucu durduruldu")
-    except Exception as e:
-        logger.error(f"Sunucu hatası: {e}")
-        sys.exit(1)
+    server = SimpleUAVServer(args.host, args.port)
+    server.start_server()
